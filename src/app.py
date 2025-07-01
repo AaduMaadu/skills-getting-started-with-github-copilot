@@ -10,17 +10,28 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
 import os
 from pathlib import Path
+from pymongo import MongoClient
+from typing import Dict, Any
 
 app = FastAPI(title="Mergington High School API",
               description="API for viewing and signing up for extracurricular activities")
+
+# MongoDB connection
+MONGODB_URL = "mongodb://localhost:27017/"
+DATABASE_NAME = "mergington_school"
+COLLECTION_NAME = "activities"
+
+client = MongoClient(MONGODB_URL)
+db = client[DATABASE_NAME]
+activities_collection = db[COLLECTION_NAME]
 
 # Mount the static files directory
 current_dir = Path(__file__).parent
 app.mount("/static", StaticFiles(directory=os.path.join(Path(__file__).parent,
           "static")), name="static")
 
-# In-memory activity database
-activities = {
+# Initial activity data for database seeding
+INITIAL_ACTIVITIES = {
     "Chess Club": {
         "description": "Learn strategies and compete in chess tournaments",
         "schedule": "Fridays, 3:30 PM - 5:00 PM",
@@ -80,6 +91,54 @@ activities = {
     }
 }
 
+def initialize_database():
+    """Initialize the database with activity data if it's empty"""
+    try:
+        # Check if activities already exist
+        if activities_collection.count_documents({}) == 0:
+            print("Seeding database with initial activities...")
+            
+            # Insert activities with name as the _id for easy querying
+            documents = []
+            for activity_name, activity_data in INITIAL_ACTIVITIES.items():
+                doc = {
+                    "_id": activity_name,
+                    "name": activity_name,
+                    **activity_data
+                }
+                documents.append(doc)
+            
+            activities_collection.insert_many(documents)
+            print(f"Inserted {len(documents)} activities into the database.")
+        else:
+            print("Database already contains activities, skipping initialization.")
+    except Exception as e:
+        print(f"Error initializing database: {e}")
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize database on startup"""
+    initialize_database()
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Close MongoDB connection on shutdown"""
+    client.close()
+
+# Add a health check endpoint
+@app.get("/health")
+def health_check():
+    """Health check endpoint"""
+    try:
+        # Ping MongoDB
+        client.admin.command('ping')
+        return {"status": "healthy", "database": "connected"}
+    except Exception as e:
+        return {"status": "unhealthy", "error": str(e)}
+
+# Initialize database on startup
+initialize_database()
+
 
 @app.get("/")
 def root():
@@ -88,6 +147,13 @@ def root():
 
 @app.get("/activities")
 def get_activities():
+    """Get all activities from MongoDB"""
+    activities = {}
+    for activity in activities_collection.find():
+        activity_name = activity["_id"]
+        # Remove MongoDB specific fields for clean response
+        activity_data = {k: v for k, v in activity.items() if k not in ["_id", "name"]}
+        activities[activity_name] = activity_data
     return activities
 
 
@@ -95,16 +161,43 @@ def get_activities():
 def signup_for_activity(activity_name: str, email: str):
     """Sign up a student for an activity"""
     # Validate activity exists
-    if activity_name not in activities:
+    activity = activities_collection.find_one({"_id": activity_name})
+    if not activity:
         raise HTTPException(status_code=404, detail="Activity not found")
-
-    # Get the specific activity
-    activity = activities[activity_name]
 
     # Validate student is not already signed up
     if email in activity["participants"]:
         raise HTTPException(status_code=400, detail="Student is already signed up")
 
-    # Add student
-    activity["participants"].append(email)
+    # Validate capacity
+    if len(activity["participants"]) >= activity["max_participants"]:
+        raise HTTPException(status_code=400, detail="Activity is at maximum capacity")
+
+    # Add student to activity
+    activities_collection.update_one(
+        {"_id": activity_name},
+        {"$push": {"participants": email}}
+    )
+    
     return {"message": f"Signed up {email} for {activity_name}"}
+
+
+@app.delete("/activities/{activity_name}/participants/{email}")
+def remove_participant(activity_name: str, email: str):
+    """Remove a student from an activity"""
+    # Validate activity exists
+    activity = activities_collection.find_one({"_id": activity_name})
+    if not activity:
+        raise HTTPException(status_code=404, detail="Activity not found")
+
+    # Validate student is signed up
+    if email not in activity["participants"]:
+        raise HTTPException(status_code=404, detail="Student not found in activity")
+
+    # Remove student from activity
+    activities_collection.update_one(
+        {"_id": activity_name},
+        {"$pull": {"participants": email}}
+    )
+    
+    return {"message": f"Removed {email} from {activity_name}"}
